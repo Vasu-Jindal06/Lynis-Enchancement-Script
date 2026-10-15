@@ -1,0 +1,165 @@
+
+#!/bin/sh
+# Custom Lynis test: Systemd Service Risk Analyzer
+# Test ID: CUST-1010
+
+Register --test-no CUST-1010 --weight M --network NO --category security --description "Analyze systemd service permissions and hardening"
+
+if [ "${SKIPTEST}" -eq 0 ]; then
+    FOUNDPROBLEM=0
+    CHECKED=0
+
+    if command -v systemctl >/dev/null 2>&1; then
+        for UNIT in $(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk '{print $1}'); do
+            case "${UNIT}" in
+                *.service) ;;
+                *) continue ;;
+            esac
+
+            UNITPATH=$(systemctl show "${UNIT}" -p FragmentPath --value 2>/dev/null)
+
+            case "${UNITPATH}" in
+                /*) ;;
+                *) continue ;;
+            esac
+
+            [ -f "${UNITPATH}" ] || continue
+            CHECKED=$((CHECKED + 1))
+
+            # A unit file writable by non-root users can be modified
+            # to change the service's execution behavior.
+            if find "${UNITPATH}" -maxdepth 0 \( -perm -0002 -o -perm -0020 \) -print 2>/dev/null | grep -q .; then
+                FOUNDPROBLEM=1
+                ReportWarning "${TEST_NO}" "Service unit file is group/world writable: ${UNIT}" "${UNITPATH}" "text:Review ownership and permissions of ${UNITPATH}"
+            fi
+
+            # Inspect effective systemd properties, not just unit-file text.
+            USERPROP=$(systemctl show "${UNIT}" -p User --value 2>/dev/null)
+            EXECSTART=$(systemctl show "${UNIT}" -p ExecStart --value 2>/dev/null)
+            NNP=$(systemctl show "${UNIT}" -p NoNewPrivileges --value 2>/dev/null)
+            PROTECTSYSTEM=$(systemctl show "${UNIT}" -p ProtectSystem --value 2>/dev/null)
+            PRIVATEtmp=$(systemctl show "${UNIT}" -p PrivateTmp --value 2>/dev/null)
+
+            # Empty User means systemd's default identity, normally root.
+            
+if [ -z "${USERPROP}" ] || [ "${USERPROP}" = "root" ]; then
+    case "${UNITPATH}" in
+        /etc/systemd/system/*|/usr/local/lib/systemd/system/*|/usr/local/etc/systemd/system/*)
+            if [ "${NNP}" != "yes" ] &&
+               [ "${PROTECTSYSTEM}" = "no" ] &&
+               [ "${PRIVATEtmp}" != "yes" ]; then
+                FOUNDPROBLEM=1
+                ReportWarning "${TEST_NO}" "Locally configured root service lacks three selected hardening protections: ${UNIT}" "${UNITPATH}" "text:Review whether this service can safely use NoNewPrivileges, ProtectSystem, and PrivateTmp"
+            fi
+            ;;
+    esac
+fi
+
+
+            
+# Extract only systemd's executable path, not paths in its arguments.
+EXE=$(printf '%s\n' "${EXECSTART}" |
+    sed -n 's/.*path=\([^ ;}]*\).*/\1/p')
+
+if [ -n "${EXE}" ] && [ -f "${EXE}" ]; then
+    REAL_EXE=$(readlink -f "${EXE}" 2>/dev/null)
+
+    if [ -n "${REAL_EXE}" ] && [ -f "${REAL_EXE}" ]; then
+        if find "${REAL_EXE}" -maxdepth 0 -type f \
+            \( -perm -0002 -o -perm -0020 \) \
+            -print 2>/dev/null | grep -q .; then
+
+            FOUNDPROBLEM=1
+	
+	
+ReportWarning "${TEST_NO}" \
+    "Service executable target is group/world writable: ${UNIT}" \
+    "${REAL_EXE}" \
+    "text:Review ownership and permissions of ${REAL_EXE}"
+
+         fi
+    fi
+fi
+           
+        done
+
+        if [ "${FOUNDPROBLEM}" -eq 0 ]; then
+            Display --indent 2 --text "Systemd service permission and hardening checks (${CHECKED} unit files)" --result "${STATUS_OK}" --color GREEN
+        else
+            Display --indent 2 --text "Systemd service permission and hardening checks (${CHECKED} unit files)" --result "${STATUS_WARNING}" --color YELLOW
+            ReportSuggestion "${TEST_NO}" "Review the reported systemd service risks and apply appropriate least-privilege and hardening settings."
+        fi
+    else
+        Display --indent 2 --text "Systemd service risk analysis" --result "SKIPPED" --color YELLOW
+        LogText "systemctl was not found; CUST-1010 could not inspect systemd services."
+    fi
+fi
+
+
+# CUST-1020: Scheduled Task Risk Analyzer
+Register --test-no CUST-1020 --weight M --network NO --category security --description "Analyze scheduled task script permissions"
+
+if [ "${SKIPTEST}" -eq 0 ]; then
+    FOUNDPROBLEM=0
+    CHECKED=0
+
+    if command -v find >/dev/null 2>&1; then
+        for TASKDIR in /etc/cron.d /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly; do
+            [ -d "${TASKDIR}" ] || continue
+
+            for TASK in "${TASKDIR}"/*; do
+                [ -f "${TASK}" ] || continue
+                [ -L "${TASK}" ] && continue
+
+                CHECKED=$((CHECKED + 1))
+
+                TASK_OWNER=$(stat -c '%U' "${TASK}" 2>/dev/null)
+                TASK_MODE=$(stat -c '%a' "${TASK}" 2>/dev/null)
+
+                # Scheduled task files should not be writable by everyone.
+                if [ -n "${TASK_MODE}" ]; then
+                    TASK_PERMS=$(printf '%d' "0${TASK_MODE}")
+                    if [ $((TASK_PERMS & 2)) -ne 0 ]; then
+                        FOUNDPROBLEM=1
+                        ReportWarning "${TEST_NO}" \
+                            "Scheduled task file is world-writable" \
+                            "${TASK}" \
+                            "text:Remove world-write permission and review the file owner"
+                    fi
+                fi
+
+                # Root-owned task files must not be writable by non-root users.
+                if [ "${TASK_OWNER}" = "root" ] && [ -n "${TASK_MODE}" ]; then
+                    if [ $((TASK_PERMS & 18)) -ne 0 ]; then
+                        FOUNDPROBLEM=1
+                        ReportWarning "${TEST_NO}" \
+                            "Root-owned scheduled task is writable by group or others" \
+                            "${TASK}" \
+                            "text:Restrict write permissions and review group ownership"
+                    fi
+                fi
+
+                # Check whether the task's parent directory is writable by others.
+                if find "${TASKDIR}" -maxdepth 0 -type d \
+                    \( -perm -0002 -o -perm -0020 \) \
+                    -print 2>/dev/null | grep -q .; then
+                    FOUNDPROBLEM=1
+                    ReportWarning "${TEST_NO}" \
+                        "Scheduled task directory is group/world-writable" \
+                        "${TASKDIR}" \
+                        "text:Review directory ownership and permissions"
+                fi
+            done
+        done
+
+        if [ "${FOUNDPROBLEM}" -eq 0 ]; then
+            Display --indent 2 --text "Scheduled task permission checks (${CHECKED} files)" --result "${STATUS_OK}" --color GREEN
+        else
+            Display --indent 2 --text "Scheduled task permission checks (${CHECKED} files)" --result "${STATUS_WARNING}" --color YELLOW
+            ReportSuggestion "${TEST_NO}" "Review scheduled-task ownership and permissions, especially for tasks executed with elevated privileges."
+        fi
+    else
+        Display --indent 2 --text "Scheduled task risk analysis" --result "SKIPPED" --color YELLOW
+        LogText "find was not found; CUST-1020 could not inspect scheduled tasks."
+    fi
+fi
